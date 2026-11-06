@@ -2,6 +2,7 @@ name: Build and Publish EPG
 
 on:
   schedule:
+    # 06:17 and 18:17 Asia/Riyadh
     - cron: '17 3,15 * * *'
   workflow_dispatch:
   push:
@@ -21,8 +22,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,10 +36,9 @@ jobs:
         run: python -m unittest discover -p 'test_*.py'
       - name: Build full regional programme guide
         run: python build_custom_epg.py --input channels.csv --outdir generated
-      - name: Validate and prepare website
+      - name: Validate full guide and calculate coverage
         run: python publish_guide.py --candidate generated/Custom_EPG.xml.gz --destination site
-      - name: Publish compressed backup via GitHub Releases
-        continue-on-error: true
+      - name: Publish compressed EPG to stable Release URL
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -45,25 +46,5 @@ jobs:
           if gh release view epg-current >/dev/null 2>&1; then
             gh release upload epg-current generated/guide.xml.gz --clobber
           else
-            gh release create epg-current generated/guide.xml.gz --title "Live EPG XMLTV (auto-updated)" --notes "Generated XMLTV listings. Updated by the scheduled workflow. No IPTV credentials."
+            gh release create epg-current generated/guide.xml.gz --title "Live EPG XMLTV (auto-updated)" --notes "Generated XMLTV listings, refreshed automatically. No IPTV credentials."
           fi
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: site
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
