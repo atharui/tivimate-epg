@@ -10,6 +10,7 @@ import argparse
 import gzip
 import json
 import shutil
+import csv
 
 
 def validate_and_publish(source: Path, destination: Path) -> dict:
@@ -60,6 +61,28 @@ def validate_and_publish(source: Path, destination: Path) -> dict:
         'recent_future_sample_1_in_20': current,
         'note': 'Channel IDs with EPG listings; not all channels automatically bind in TiviMate.',
     }
+    # Publish aggregate coverage only; never publish the playlist or provider IDs.
+    report = source.parent / 'EPG_Match_Report.csv'
+    if report.is_file():
+        coverage = {}
+        with report.open('r', encoding='utf-8-sig', newline='') as inp:
+            for row in csv.DictReader(inp):
+                region = row.get('Region', 'OTHER')
+                stats = coverage.setdefault(region, {'total': 0, 'with_programmes': 0,
+                                                    'without_programmes': 0, 'with_playlist_epg_id': 0,
+                                                    'potential_auto_id_with_programmes': 0})
+                stats['total'] += 1
+                epg_id = bool((row.get('EPGChannelID') or '').strip())
+                actual = int(row.get('AvailableProgrammes') or 0) > 0
+                if actual: stats['with_programmes'] += 1
+                else: stats['without_programmes'] += 1
+                if epg_id: stats['with_playlist_epg_id'] += 1
+                if actual and epg_id: stats['potential_auto_id_with_programmes'] += 1
+        summary['coverage_by_region'] = coverage
+        summary['actual_listed_channels'] = sum(x['with_programmes'] for x in coverage.values())
+        summary['target_channels'] = sum(x['total'] for x in coverage.values())
+        summary['important'] = 'Listings in this feed do not guarantee TiviMate auto-matches channels with missing playlist tvg-id.'
+        (destination / 'coverage.json').write_text(json.dumps(coverage, ensure_ascii=False, indent=2), encoding='utf-8')
     (destination / 'status.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     (destination / 'index.html').write_text('''<!doctype html><html lang="en"><meta charset="utf-8"><title>Personal XMLTV guide</title>
     <h1>Personal XMLTV guide</h1><p>Use the <a href="guide.xml">XMLTV guide</a> in TiviMate or the <a href="guide.xml.gz">compressed version</a>.</p>

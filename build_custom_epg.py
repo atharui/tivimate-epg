@@ -32,8 +32,8 @@ EU_SOURCES={
   'UK':['UK1','GB_ORG'],'BH':['BA1'],'ARM':['AM1'],'CRN':['ME_ORG'],'EN':['UK1'],
   'RU':['RU_ORG'],
 }
-AR_SOURCES=['AE1','BEIN1','ALJAZEERA1','SA2','SA1','EG1','BEIN_WEB']
-US_SOURCES=['US2','US_LOCALS1','US_SPORTS1','PEACOCK1','US_ORG']
+AR_SOURCES=['AE1','BEIN1','ALJAZEERA1','SA2','SA1','EG1','BEIN_WEB','AE_ORG','EG_ORG','LB_ORG','ARABIC_GUIDE']
+US_SOURCES=['US2','US_LOCALS1','US_SPORTS1','PEACOCK1','US_ORG','PLEX1','RAKUTEN1','DISTROTV1']
 # Extra source lists are only requested if categories in user's CSV need them.
 SPECIAL_URLS={'RU_ORG':'https://iptv-epg.org/files/epg-ru.xml.gz',
               'ME_ORG':'https://iptv-epg.org/files/epg-me.xml.gz',
@@ -46,14 +46,35 @@ SPECIAL_URLS={'RU_ORG':'https://iptv-epg.org/files/epg-ru.xml.gz',
               'BEIN_WEB':'https://m3u-edit.com/epg-source.php?file=bein.com.xml',
               'DE_SKY':'https://m3u-edit.com/epg-source.php?file=germany_sky.de.xml',
               'DE_MAGENTA':'https://m3u-edit.com/epg-source.php?file=germany_web.magentatv.de.xml',
-              'AM1':'https://iptv-epg.org/files/epg-am.xml.gz'}
+              'AM1':'https://iptv-epg.org/files/epg-am.xml.gz',
+              'AE_ORG':'https://iptv-epg.org/files/epg-ae.xml.gz',
+              'EG_ORG':'https://iptv-epg.org/files/epg-eg.xml.gz',
+              'LB_ORG':'https://iptv-epg.org/files/epg-lb.xml.gz',
+              'ARABIC_GUIDE':'https://raw.githubusercontent.com/GhalebAldoboni/EPG-Guide/master/ArabicEPG.xml',
+              'AL_ORG':'https://iptv-epg.org/files/epg-al.xml.gz',
+              'AT_ORG':'https://iptv-epg.org/files/epg-at.xml.gz',
+              'BE_ORG':'https://iptv-epg.org/files/epg-be.xml.gz',
+              'NL_ORG':'https://iptv-epg.org/files/epg-nl.xml.gz',
+              'PL_ORG':'https://iptv-epg.org/files/epg-pl.xml.gz',
+              'RO_ORG':'https://iptv-epg.org/files/epg-ro.xml.gz',
+              'SE_ORG':'https://iptv-epg.org/files/epg-se.xml.gz',
+              'TR_ORG':'https://iptv-epg.org/files/epg-tr.xml.gz',
+              'UA_ORG':'https://iptv-epg.org/files/epg-ua.xml.gz',
+              'PT_ORG':'https://iptv-epg.org/files/epg-pt.xml.gz',
+              'GR_ORG':'https://iptv-epg.org/files/epg-gr.xml.gz',
+              'BA_ORG':'https://iptv-epg.org/files/epg-ba.xml.gz',
+              'RS_ORG':'https://iptv-epg.org/files/epg-rs.xml.gz'}
+# Additional country guides are based on the countries represented in the user's playlist.
+EXTRA_EU={'AL':'AL_ORG','AT':'AT_ORG','BE':'BE_ORG','NL':'NL_ORG','PL':'PL_ORG',
+          'RO':'RO_ORG','SE':'SE_ORG','TR':'TR_ORG','UA':'UA_ORG',
+          'PT':'PT_ORG','GR':'GR_ORG','BA':'BA_ORG','SR':'RS_ORG'}
 HTTP_HEADERS={'User-Agent':'Mozilla/5.0 (compatible; LocalTVGuideBuilder/2.0)', 'Accept':'*/*'}
 REMOVE_TOKENS={'hd','fhd','uhd','4k','8k','sd','hevc','h265','h264','3840','1080','720','50fps','60fps',
                'iptv','live','tv','channel','stream','en','vip','ultra','raw'}
 IGNORE_FUZZY={'abc','nbc','cbs','fox','the','one','itv','be','sports','sky','ppv','event','now','4k','1','2'}
 
 def normalize(s):
-    s=(s or '').split('◉',1)[0].strip()
+    s=(s or '').strip()
     s=unicodedata.normalize('NFKD',s)
     s=''.join(c for c in s if not unicodedata.combining(c))
     s=re.sub(r'^[A-Z]{2,5}\s*:\s*','',s.strip(),flags=re.I)
@@ -64,12 +85,58 @@ def normalize(s):
     s=re.sub(r'(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])',' ',s)
     s=re.sub(r'[^\w\u0600-\u06ff]+',' ',s.lower())
     words=[w for w in s.split() if w not in REMOVE_TOKENS]
+    # Singular/plural spelling and common official broadcaster spacing.
+    words=['sport' if w=='sports' else w for w in words]
     return ' '.join(words)
 
 def epg_id_as_name(s):
     # Most EPGShare IDs encode a human-readable display name, before the country suffix.
     s=s.rsplit('.',1)[0].replace('.', ' ')
     return normalize(s)
+
+def name_variants(s):
+    """Use independently visible Latin and Arabic channel names, never stream metadata."""
+    parts=(s or '').split('◉')
+    result=[]
+    for part in parts:
+        n=normalize(part)
+        if n and n not in result:result.append(n)
+    # Common broadcaster spellings; safe only when exact after normalization.
+    for n in list(result):
+        for a,b in [('aljazeera','al jazeera'),('al arabiya','alarabiya'),
+                    ('abu dhabi','abudhabi'),('al jazira','al jazeera'),
+                    ('bein','be in')]:
+            if a in n:
+                alias=n.replace(a,b)
+                if alias not in result:result.append(alias)
+    return result
+
+def select_identical_station(row,candidates):
+    """Resolve same-channel/HD aliases across providers without guessing US local affiliates."""
+    candidates=list(dict.fromkeys(candidates))
+    if not candidates:return None
+    if len(candidates)==1:return candidates[0]
+    name=row['ChannelName']
+    sigs=callsign(name)
+    # Distinct US callsigns are different stations with different schedules.
+    if row['Region']=='USA':
+        if sigs:
+            subset=[c for c in candidates if callsign(c[1]) & sigs]
+            if subset:candidates=subset
+        else:
+            sigs_in_sources={frozenset(callsign(c[1])) for c in candidates if callsign(c[1])}
+            if len(sigs_in_sources)>1:return None
+    if len(candidates)==1:return candidates[0]
+    rank={source:i for i,source in enumerate(country_sources(row))}
+    # Keep formerly preferred sources first; do not override an existing match.
+    candidates.sort(key=lambda c:(rank.get(c[0],999),
+        0 if ('HD' in name.upper() and re.search(r'\bhd\b',c[1],re.I)) else 1,
+        len(c[1]),c[1]))
+    best=candidates[0]
+    # Inside the preferred source, genuinely different names/feeds remain ambiguous.
+    same_source=[c for c in candidates if c[0]==best[0]]
+    roots={normalize(epg_id_as_name(c[1])) for c in same_source}
+    return best if len(roots)<=1 else None
 
 def callsign(s):
     # Local US affiliates: station callsign distinguishes cities and time zones.
@@ -130,7 +197,11 @@ def index_one(source,cache):
 def country_sources(row):
     region=row['Region'];code=row['CountryCode']
     if region=='USA':return US_SOURCES
-    if region=='EUROPE':return EU_SOURCES.get(code,['UK1'])
+    if region=='EUROPE':
+        found=list(EU_SOURCES.get(code,['UK1']))
+        extra=EXTRA_EU.get(code)
+        if extra and extra not in found:found.append(extra)
+        return found
     if region=='ARABIC':return AR_SOURCES
     return []
 
@@ -141,11 +212,11 @@ def index_by_name(catalog):
             obj=(source,id_)
             by_exact[id_.lower()].append(obj)
             for name in list(names)+[epg_id_as_name(id_)]:
-                n=normalize(name)
-                if not n:continue
-                if obj not in by_norm[n]:by_norm[n].append(obj)
-                first=n.split()[0]
-                if obj not in by_first[first]:by_first[first].append(obj)
+                for n in name_variants(name):
+                    if not n:continue
+                    if obj not in by_norm[n]:by_norm[n].append(obj)
+                    first=n.split()[0]
+                    if obj not in by_first[first]:by_first[first].append(obj)
                 for sig in callsign(id_+' '+name):
                     if obj not in by_call[sig]:by_call[sig].append(obj)
     return by_exact,by_norm,by_first,by_call
@@ -156,39 +227,44 @@ def pick_match(row,idx):
     eid=(row['EPGChannelID'] or '').strip().lower()
     if eid:
         same=[c for c in exact.get(eid,[]) if c[0] in allowed]
-        if len(same)==1:return same[0], 'EXACT_ID'
-        if len(same)>1:return same[0], 'EXACT_ID_DUPLICATE_SOURCE'
-    n=normalize(row['ChannelName'])
-    same=[c for c in by_norm.get(n,[]) if c[0] in allowed]
-    if len(same)==1:return same[0], 'EXACT_NAME'
-    # A name appearing in more than one US station/feed is ambiguous: never guess.
-    if len(same)>1:
-        established=[c for c in same if c[0] not in {'US_ORG','GB_ORG','DE_ORG','FR_ORG','IT_ORG','ES_ORG','BEIN_WEB','DE_SKY','DE_MAGENTA'}]
-        if len(established)==1:return established[0],'PREFERRED_ESTABLISHED_NAME'
-        return None,'AMBIGUOUS_NAME'
+        if same:
+            chosen=select_identical_station(row,same)
+            if chosen:return chosen, 'EXACT_ID'
+    variants=name_variants(row['ChannelName'])
+    for n in variants:
+        same=[c for c in by_norm.get(n,[]) if c[0] in allowed]
+        if same:
+            chosen=select_identical_station(row,same)
+            if chosen:return chosen, 'EXACT_NAME'
     if row['Region']=='USA':
         signatures=callsign(row['ChannelName'])
-        for sig in signatures:
-            matches=[c for c in by_call.get(sig,[]) if c[0] in allowed]
-            unique=set(matches)
-            if len(unique)==1:return next(iter(unique)),'UNIQUE_US_CALLSIGN'
-            established=[c for c in unique if c[0]=='US_LOCALS1']
-            if len(established)==1:return established[0],'PREFERRED_US_LOCALS_CALLSIGN'
-    if not n or len(n)<4:return None,'NO_SAFE_MATCH'
-    tokens=n.split()
-    if not tokens or (len(tokens)==1 and tokens[0] in IGNORE_FUZZY):return None,'NO_SAFE_MATCH'
-    choices=[c for c in by_first.get(tokens[0],[]) if c[0] in allowed]
-    if not choices or len(choices)>100:return None,'NO_SAFE_MATCH'
-    # Deliberately conservative: 24/7 and PPV channels should not be assigned unrelated schedules.
-    scores=[]
-    for source,cid in choices:
-        cn=epg_id_as_name(cid)
-        score=difflib.SequenceMatcher(None,n,cn).ratio()
-        if score>=.94:scores.append((score,(source,cid)))
-    scores.sort(key=lambda x:x[0],reverse=True)
-    if scores and (len(scores)==1 or scores[0][0]-scores[1][0]>=.07):
-        return scores[0][1],'HIGH_CONFIDENCE_NAME'
-    return None, 'NO_SAFE_MATCH'
+        if signatures:
+            # A unique American station callsign is much safer than a network label.
+            matches=set()
+            for sig in signatures:
+                matches.update(c for c in by_call.get(sig,[]) if c[0] in allowed)
+            chosen=select_identical_station(row,matches)
+            if chosen and callsign(chosen[1]) & signatures:
+                return chosen,'US_CALLSIGN'
+    if not variants:return None,'NO_SAFE_MATCH'
+    for n in variants:
+        if len(n)<4:continue
+        tokens=n.split()
+        if not tokens or (len(tokens)==1 and tokens[0] in IGNORE_FUZZY):continue
+        choices=[c for c in by_first.get(tokens[0],[]) if c[0] in allowed]
+        if not choices or len(choices)>100:continue
+        scores=[]
+        for source,cid in choices:
+            cn=epg_id_as_name(cid)
+            score=difflib.SequenceMatcher(None,n,cn).ratio()
+            if score>=.96:scores.append((score,(source,cid)))
+        if not scores:continue
+        scores.sort(key=lambda x:x[0],reverse=True)
+        top=[c for score,c in scores if scores[0][0]-score<=.015]
+        chosen=select_identical_station(row,top)
+        if chosen and (len(scores)==len(top) or scores[0][0]-scores[len(top)][0]>=.07):
+            return chosen,'HIGH_CONFIDENCE_NAME'
+    return None,'NO_SAFE_MATCH'
 
 def output_id(row,matched):
     return row['EPGChannelID'].strip() or matched[1]
