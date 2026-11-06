@@ -2,7 +2,6 @@ name: Build and Publish EPG
 
 on:
   schedule:
-    # 03:17 and 15:17 UTC = 06:17 and 18:17 in Saudi Arabia
     - cron: '17 3,15 * * *'
   workflow_dispatch:
   push:
@@ -15,7 +14,7 @@ on:
       - 'test_build_custom_epg.py'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: epg-publish
@@ -37,6 +36,17 @@ jobs:
         run: python build_custom_epg.py --input channels.csv --outdir generated
       - name: Validate and prepare website
         run: python publish_guide.py --candidate generated/Custom_EPG.xml.gz --destination site
+      - name: Publish compressed backup via GitHub Releases
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp generated/Custom_EPG.xml.gz generated/guide.xml.gz
+          if gh release view epg-current >/dev/null 2>&1; then
+            gh release upload epg-current generated/guide.xml.gz --clobber
+          else
+            gh release create epg-current generated/guide.xml.gz --title "Live EPG XMLTV (auto-updated)" --notes "Generated XMLTV listings. Updated by the scheduled workflow. No IPTV credentials."
+          fi
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
       - name: Upload Pages artifact
