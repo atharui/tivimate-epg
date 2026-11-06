@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Build a targeted XMLTV guide from independently published programme data.
+
+Run in directory containing Channels_US_Europe_Arabic.csv.
+No subscription credentials, stream URLs or private IPTV APIs are used.
+"""
+from __future__ import annotations
+import argparse
+from collections import Counter, defaultdict
+import concurrent.futures
+import csv
+import difflib
+import gzip
+import io
+import os
+from pathlib import Path
+import re
+import shutil
+import time
+import sys
+import unicodedata
+import urllib.request
+import xml.etree.ElementTree as ET
+
+BASE='https://epgshare01.online/epgshare01/'
+EU_SOURCES={
+  'AL':['AL1'],'AT':['AT1'],'BA':['BA1'],'BE':['BE2'],'BG':['BG1'],
+  'CH':['CH1'],'CR':['HR1'],'CZ':['CZ1'],'DE':['DE1','DE_SKY','DE_MAGENTA','DE_ORG'],'DK':['DK1'],'ES':['ES1','ES_ORG'],
+  'FI':['FI1'],'FR':['FR1','FR_ORG'],'GR':['GR1'],'HU':['HU1'],'IT':['IT1','IT_ORG'],'MK':['RS1'],
+  'NL':['NL1'],'NO':['NO1'],'PL':['PL1'],'PT':['PT1'],'RO':['RO1','RO2'],
+  'SE':['SE1'],'SK':['SK1'],'SR':['RS1'],'TR':['TR1','TR3'],'UA':['UA1'],
+  'UK':['UK1','GB_ORG'],'BH':['BA1'],'ARM':['AM1'],'CRN':['ME_ORG'],'EN':['UK1'],
+  'RU':['RU_ORG'],
+}
+AR_SOURCES=['AE1','BEIN1','ALJAZEERA1','SA2','SA1','EG1','BEIN_WEB']
+US_SOURCES=['US2','US_LOCALS1','US_SPORTS1','PEACOCK1','US_ORG']
+# Extra source lists are only requested if categories in user's CSV need them.
+SPECIAL_URLS={'RU_ORG':'https://iptv-epg.org/files/epg-ru.xml.gz',
+              'ME_ORG':'https://iptv-epg.org/files/epg-me.xml.gz',
+              'US_ORG':'https://iptv-epg.org/files/epg-us.xml.gz',
+              'GB_ORG':'https://iptv-epg.org/files/epg-gb.xml.gz',
+              'DE_ORG':'https://iptv-epg.org/files/epg-de.xml.gz',
+              'FR_ORG':'https://iptv-epg.org/files/epg-fr.xml.gz',
+              'IT_ORG':'https://iptv-epg.org/files/epg-it.xml.gz',
+              'ES_ORG':'https://iptv-epg.org/files/epg-es.xml.gz',
+              'BEIN_WEB':'https://m3u-edit.com/epg-source.php?file=bein.com.xml',
+              'DE_SKY':'https://m3u-edit.com/epg-source.php?file=germany_sky.de.xml',
+              'DE_MAGENTA':'https://m3u-edit.com/epg-source.php?file=germany_web.magentatv.de.xml',
+              'AM1':'https://iptv-epg.org/files/epg-am.xml.gz'}
+HTTP_HEADERS={'User-Agent':'Mozilla/5.0 (compatible; LocalTVGuideBuilder/2.0)', 'Accept':'*/*'}
+REMOVE_TOKENS={'hd','fhd','uhd','4k','8k','sd','hevc','h265','h264','3840','1080','720','50fps','60fps',
+               'iptv','live','tv','channel','stream','en','vip','ultra','raw'}
+IGNORE_FUZZY={'abc','nbc','cbs','fox','the','one','itv','be','sports','sky','ppv','event','now','4k','1','2'}
+
+def normalize(s):
+    s=(s or '').split('◉',1)[0].strip()
+    s=unicodedata.normalize('NFKD',s)
+    s=''.join(c for c in s if not unicodedata.combining(c))
+    s=re.sub(r'^[A-Z]{2,5}\s*:\s*','',s.strip(),flags=re.I)
+    s=re.sub(r'\b(?:US|UK|DE|FR|ES|IT|AR|TR|NL|BE|RO|PL|AT|SE|NO|DK|RU|SA|HD|FHD|UHD|4K|8K|1080P|720P|HEVC|H265|H264|50FPS|60FPS)\s*[:|]\s*',' ',s,flags=re.I)
+    s=re.sub(r'\s*(?:◉|⚽|♦|♬|\[MULTI AUDIO\])\s*',' ',s,flags=re.I)
+    s=s.replace('&',' and ')
+    s=re.sub(r'(?i)\b(?:4K|8K|2160P|1080P|720P|50FPS|60FPS)\b',' ',s)
+    s=re.sub(r'(?<=[A-Za-z])(?=\d)|(?<=\d)(?=[A-Za-z])',' ',s)
+    s=re.sub(r'[^\w\u0600-\u06ff]+',' ',s.lower())
+    words=[w for w in s.split() if w not in REMOVE_TOKENS]
+    return ' '.join(words)
+
+def epg_id_as_name(s):
+    # Most EPGShare IDs encode a human-readable display name, before the country suffix.
+    s=s.rsplit('.',1)[0].replace('.', ' ')
+    return normalize(s)
+
+def callsign(s):
+    # Local US affiliates: station callsign distinguishes cities and time zones.
+    return {x for x in re.findall(r'\b[WK][A-Z]{2,4}\b',(s or '').upper()) if x not in {'WEST','KIDS','WIDE'}}
+
+def urlopen(url,timeout=40):
+    return urllib.request.urlopen(urllib.request.Request(url,headers=HTTP_HEADERS),timeout=timeout)
+
+def fetch_binary(url,dest):
+    dest=Path(dest);dest.parent.mkdir(parents=True,exist_ok=True)
+    if dest.exists() and dest.stat().st_size>50 and (time.time()-dest.stat().st_mtime)<12*3600:
+        return dest
+    tmp=dest.with_suffix(dest.suffix+'.partial')
+    try:
+        with urlopen(url,60) as src,open(tmp,'wb') as out:
+            shutil.copyfileobj(src,out,1024*256)
+        if tmp.stat().st_size<100: raise IOError('Downloaded file unexpectedly small')
+        tmp.replace(dest)
+    finally:
+        if tmp.exists():tmp.unlink()
+    return dest
+
+def xml_open(path):
+    with open(path,'rb') as r:
+        zipped=r.read(2)==b'\x1f\x8b'
+    return gzip.open(path,'rb') if zipped else open(path,'rb')
+
+def read_xml_index(path):
+    result=[]
+    with xml_open(path) as fh:
+        context=ET.iterparse(fh,events=('start','end'))
+        root=None
+        for event,elem in context:
+            if root is None and event=='start':root=elem
+            if event=='end' and elem.tag=='channel':
+                id_=elem.get('id','')
+                names=[x.text for x in elem.findall('display-name') if x.text]
+                if id_:result.append((id_,names))
+                elem.clear()
+                if root is not None:root.clear()
+            elif event=='end' and elem.tag=='programme':
+                elem.clear()
+                if root is not None:root.clear()
+    return result
+
+def index_one(source,cache):
+    try:
+        if source in SPECIAL_URLS:
+            xmlfile=fetch_binary(SPECIAL_URLS[source],cache/(source+'.xml.gz'))
+            return source,read_xml_index(xmlfile),None
+        url=BASE+'epg_ripper_'+source+'.txt'
+        file=fetch_binary(url,cache/(source+'.txt'))
+        contents=file.read_text(encoding='utf-8-sig',errors='replace')
+        ids=[line.strip() for line in contents.splitlines() if line.strip() and not line.startswith('--') and not re.fullmatch(r'\d{10,14}',line.strip())]
+        return source,[(x,[epg_id_as_name(x)]) for x in ids],None
+    except Exception as ex:return source,[],str(ex)
+
+def country_sources(row):
+    region=row['Region'];code=row['CountryCode']
+    if region=='USA':return US_SOURCES
+    if region=='EUROPE':return EU_SOURCES.get(code,['UK1'])
+    if region=='ARABIC':return AR_SOURCES
+    return []
+
+def index_by_name(catalog):
+    by_exact=defaultdict(list);by_norm=defaultdict(list);by_first=defaultdict(list);by_call=defaultdict(list)
+    for source,entries in catalog.items():
+        for id_,names in entries:
+            obj=(source,id_)
+            by_exact[id_.lower()].append(obj)
+            for name in list(names)+[epg_id_as_name(id_)]:
+                n=normalize(name)
+                if not n:continue
+                if obj not in by_norm[n]:by_norm[n].append(obj)
+                first=n.split()[0]
+                if obj not in by_first[first]:by_first[first].append(obj)
+                for sig in callsign(id_+' '+name):
+                    if obj not in by_call[sig]:by_call[sig].append(obj)
+    return by_exact,by_norm,by_first,by_call
+
+def pick_match(row,idx):
+    exact,by_norm,by_first,by_call=idx
+    allowed=set(country_sources(row))
+    eid=(row['EPGChannelID'] or '').strip().lower()
+    if eid:
+        same=[c for c in exact.get(eid,[]) if c[0] in allowed]
+        if len(same)==1:return same[0], 'EXACT_ID'
+        if len(same)>1:return same[0], 'EXACT_ID_DUPLICATE_SOURCE'
+    n=normalize(row['ChannelName'])
+    same=[c for c in by_norm.get(n,[]) if c[0] in allowed]
+    if len(same)==1:return same[0], 'EXACT_NAME'
+    # A name appearing in more than one US station/feed is ambiguous: never guess.
+    if len(same)>1:
+        established=[c for c in same if c[0] not in {'US_ORG','GB_ORG','DE_ORG','FR_ORG','IT_ORG','ES_ORG','BEIN_WEB','DE_SKY','DE_MAGENTA'}]
+        if len(established)==1:return established[0],'PREFERRED_ESTABLISHED_NAME'
+        return None,'AMBIGUOUS_NAME'
+    if row['Region']=='USA':
+        signatures=callsign(row['ChannelName'])
+        for sig in signatures:
+            matches=[c for c in by_call.get(sig,[]) if c[0] in allowed]
+            unique=set(matches)
+            if len(unique)==1:return next(iter(unique)),'UNIQUE_US_CALLSIGN'
+            established=[c for c in unique if c[0]=='US_LOCALS1']
+            if len(established)==1:return established[0],'PREFERRED_US_LOCALS_CALLSIGN'
+    if not n or len(n)<4:return None,'NO_SAFE_MATCH'
+    tokens=n.split()
+    if not tokens or (len(tokens)==1 and tokens[0] in IGNORE_FUZZY):return None,'NO_SAFE_MATCH'
+    choices=[c for c in by_first.get(tokens[0],[]) if c[0] in allowed]
+    if not choices or len(choices)>100:return None,'NO_SAFE_MATCH'
+    # Deliberately conservative: 24/7 and PPV channels should not be assigned unrelated schedules.
+    scores=[]
+    for source,cid in choices:
+        cn=epg_id_as_name(cid)
+        score=difflib.SequenceMatcher(None,n,cn).ratio()
+        if score>=.94:scores.append((score,(source,cid)))
+    scores.sort(key=lambda x:x[0],reverse=True)
+    if scores and (len(scores)==1 or scores[0][0]-scores[1][0]>=.07):
+        return scores[0][1],'HIGH_CONFIDENCE_NAME'
+    return None, 'NO_SAFE_MATCH'
+
+def output_id(row,matched):
+    return row['EPGChannelID'].strip() or matched[1]
+
+def write_csv(path,rows,fields):
+    with open(path,'w',encoding='utf-8-sig',newline='') as out:
+        w=csv.DictWriter(out,fieldnames=fields,extrasaction='ignore');w.writeheader();w.writerows(rows)
+
+def merge_guide(srcfile,source_to_ids,out,programme_counts):
+    kept=0
+    with xml_open(srcfile) as fh:
+        context=ET.iterparse(fh,events=('start','end'))
+        root=None
+        for event,elem in context:
+            if root is None and event=='start':root=elem
+            if event!='end':continue
+            if elem.tag=='programme':
+                source_id=elem.get('channel','')
+                ids=source_to_ids.get(source_id)
+                if ids:
+                    for target_id in ids:
+                        elem.set('channel',target_id)
+                        out.write(ET.tostring(elem,encoding='utf-8')+b'\n')
+                        programme_counts[target_id]+=1;kept+=1
+                elem.clear()
+                if root is not None:root.clear()
+            elif elem.tag=='channel':
+                elem.clear()
+                if root is not None:root.clear()
+    return kept
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--input',default='Channels_US_Europe_Arabic.csv')
+    ap.add_argument('--outdir',default='.')
+    args=ap.parse_args()
+    parent=Path(__file__).resolve().parent
+    inpath=Path(args.input) if Path(args.input).is_absolute() else parent/args.input
+    outdir=Path(args.outdir) if Path(args.outdir).is_absolute() else parent/args.outdir
+    outdir.mkdir(parents=True,exist_ok=True);cache=outdir/'_source_cache';cache.mkdir(exist_ok=True)
+    with open(inpath,encoding='utf-8-sig',newline='') as f:rows=list(csv.DictReader(f))
+    sources=sorted({s for row in rows for s in country_sources(row)})
+    print(f'Input: {len(rows):,} channels | {len(sources)} public source feeds')
+    print('Fetching channel indexes (does NOT contact your IPTV subscription)...')
+    cat={};errors=[]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        for future in concurrent.futures.as_completed([pool.submit(index_one,s,cache) for s in sources]):
+            src,ids,err=future.result()
+            if err:errors.append((src,err));print('  UNAVAILABLE',src,err[:100]);continue
+            cat[src]=ids;print('  INDEX',src,len(ids))
+    if not cat:raise SystemExit('No public EPG indexes were available; nothing has been fabricated.')
+    idx=index_by_name(cat)
+    report=[]; matched_sources=defaultdict(lambda:defaultdict(set)); counts=Counter(); conflicts=defaultdict(set)
+    for row in rows:
+        matched,reason=pick_match(row,idx)
+        new=dict(row)
+        new['MatchStatus']='MATCHED' if matched else 'UNMATCHED'
+        new['MatchMethod']=reason
+        new['GuideSource']=matched[0] if matched else ''
+        new['SourceGuideID']=matched[1] if matched else ''
+        new['FinalEPGID']=output_id(row,matched) if matched else ''
+        new['TiviMateAction']=('Automatic ID match is possible' if row['EPGChannelID'] else 'May require Assign EPG in TiviMate') if matched else 'No verified schedule; manual review needed'
+        report.append(new);counts[(row['Region'],new['MatchStatus'])]+=1
+        if matched:
+            conflicts[new['FinalEPGID']].add((matched[0],matched[1]))
+            matched_sources[matched[0]][matched[1]].add(new['FinalEPGID'])
+    conflict_ids={k for k,v in conflicts.items() if len(v)>1}
+    if conflict_ids:
+        print(f'WARNING: {len(conflict_ids)} target EPG IDs have conflicting source mappings; first source will be kept.')
+        first={}
+        for src,groups in list(matched_sources.items()):
+            for source_id,ids in list(groups.items()):
+                for eid in list(ids):
+                    if eid in first and first[eid]!=(src,source_id):ids.remove(eid)
+                    else:first[eid]=(src,source_id)
+    fields=list(rows[0])+['MatchStatus','MatchMethod','GuideSource','SourceGuideID','FinalEPGID','TiviMateAction']
+    write_csv(outdir/'EPG_Match_Report.csv',report,fields)
+    print('Match status by region:')
+    for reg in ('USA','EUROPE','ARABIC'):
+        print(f'  {reg}: matched={counts[(reg,"MATCHED")]:,}, unmatched={counts[(reg,"UNMATCHED")]:,}')
+    # Only real programme data is written. No synthetic/fake events.
+    epg=outdir/'Custom_EPG.xml.gz';programme_counts=Counter();failed_sources=[]
+    with gzip.open(epg,'wb',compresslevel=6) as out:
+        out.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="Personal guide-merge v2">\n')
+        channel_ids={}
+        for row in report:
+            if row['MatchStatus']!='MATCHED':continue
+            key=row['FinalEPGID']
+            channel_ids.setdefault(key,row['ChannelName'])
+        for id_,name in channel_ids.items():
+            elem=ET.Element('channel',id=id_)
+            ET.SubElement(elem,'display-name').text=name
+            out.write(ET.tostring(elem,encoding='utf-8')+b'\n')
+        for src,groups in matched_sources.items():
+            if not any(groups.values()):continue
+            try:
+                if src in SPECIAL_URLS:srcfile=cache/(src+'.xml.gz')
+                else:srcfile=fetch_binary(BASE+'epg_ripper_'+src+'.xml.gz',cache/(src+'.xml.gz'))
+                n=merge_guide(srcfile,groups,out,programme_counts)
+                print(f'  PROGRAMMES {src}: {n:,}')
+            except Exception as ex:
+                failed_sources.append((src,str(ex)));print(f'  FAILED programme download {src}: {ex}')
+        out.write(b'</tv>\n')
+    for row in report:
+        row['AvailableProgrammes']=str(programme_counts[row['FinalEPGID']]) if row['FinalEPGID'] else '0'
+        if row['FinalEPGID'] and not programme_counts[row['FinalEPGID']]:row['MatchStatus']='NO_CURRENT_PROGRAMMES'
+    write_csv(outdir/'EPG_Match_Report.csv',report,fields+['AvailableProgrammes'])
+    with open(outdir/'EPG_Summary.txt','w',encoding='utf-8') as f:
+        f.write('EPG build — verified public source data only\n')
+        f.write(f'Input channels: {len(rows)}\n')
+        for region in ('USA','EUROPE','ARABIC'):
+            group=[r for r in report if r['Region']==region]
+            actual=sum(int(r['AvailableProgrammes'])>0 for r in group)
+            f.write(f'{region}: total {len(group)}; with actual programme listings {actual}; remaining {len(group)-actual}\n')
+        f.write(f'Programme rows written: {sum(programme_counts.values())}\n')
+        f.write('Unavailable sources: '+', '.join(x[0] for x in errors+failed_sources)+'\n')
+        f.write('IMPORTANT: Channels without an EPGChannelID may require manual Assign EPG in TiviMate.\n')
+        f.write('Local TV affiliates differ by city. No unsupported schedule was invented.\n')
+    print('DONE:',epg)
+    print('IMPORTANT: a positive matching result is not equivalent to TiviMate auto-matching when the playlist ID is blank.')
+    print('See EPG_Match_Report.csv and EPG_Summary.txt in the script folder')
+
+if __name__=='__main__':main()
