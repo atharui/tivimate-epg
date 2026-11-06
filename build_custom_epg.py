@@ -332,14 +332,21 @@ def main():
             conflicts[new['FinalEPGID']].add((matched[0],matched[1]))
             matched_sources[matched[0]][matched[1]].add(new['FinalEPGID'])
     conflict_ids={k for k,v in conflicts.items() if len(v)>1}
+    first={}
     if conflict_ids:
         print(f'WARNING: {len(conflict_ids)} target EPG IDs have conflicting source mappings; first source will be kept.')
-        first={}
         for src,groups in list(matched_sources.items()):
             for source_id,ids in list(groups.items()):
                 for eid in list(ids):
                     if eid in first and first[eid]!=(src,source_id):ids.remove(eid)
                     else:first[eid]=(src,source_id)
+        for row in report:
+            eid=row['FinalEPGID']
+            if eid in conflict_ids and first.get(eid)!=(row['GuideSource'],row['SourceGuideID']):
+                row['MatchStatus']='UNMATCHED'
+                row['MatchMethod']='CONFLICTING_PROVIDER_ID'
+                row['TiviMateAction']='Manual verification: playlist EPG ID reused for different channels'
+                row['FinalEPGID']=''
     fields=list(rows[0])+['MatchStatus','MatchMethod','GuideSource','SourceGuideID','FinalEPGID','TiviMateAction']
     write_csv(outdir/'EPG_Match_Report.csv',report,fields)
     print('Match status by region:')
@@ -349,14 +356,21 @@ def main():
     epg=outdir/'Custom_EPG.xml.gz';programme_counts=Counter();failed_sources=[]
     with gzip.open(epg,'wb',compresslevel=6) as out:
         out.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="Personal guide-merge v2">\n')
-        channel_ids={}
+        # Distinct streams (SD/HD/4K) can share one verified schedule. Retain all
+        # display-name aliases so TiviMate can find the right channel by its name.
+        channel_names=defaultdict(list)
         for row in report:
             if row['MatchStatus']!='MATCHED':continue
             key=row['FinalEPGID']
-            channel_ids.setdefault(key,row['ChannelName'])
-        for id_,name in channel_ids.items():
+            aliases=[row['ChannelName']]
+            if '◉' in row['ChannelName']:
+                aliases.append(row['ChannelName'].split('◉',1)[1].strip())
+            for alias in aliases:
+                if alias and alias not in channel_names[key] and len(channel_names[key])<48:
+                    channel_names[key].append(alias)
+        for id_,names in channel_names.items():
             elem=ET.Element('channel',id=id_)
-            ET.SubElement(elem,'display-name').text=name
+            for name in names:ET.SubElement(elem,'display-name').text=name
             out.write(ET.tostring(elem,encoding='utf-8')+b'\n')
         for src,groups in matched_sources.items():
             if not any(groups.values()):continue
