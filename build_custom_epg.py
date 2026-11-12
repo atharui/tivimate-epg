@@ -343,7 +343,7 @@ def add_tv_land_choices(rows,catalog,matched_sources,channel_names):
     an east/west TV Land feed and that source is available.
     """
     if not any(r.get('Region')=='USA' and
-               re.search(r'\\bTV\\s+LAND\\b',r.get('ChannelName',''),re.I)
+               re.search(r'\bTV\s+LAND\b',r.get('ChannelName',''),re.I)
                for r in rows):
         return 0
     choices=[
