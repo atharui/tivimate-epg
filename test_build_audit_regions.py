@@ -16,7 +16,7 @@ class GuideSafety(unittest.TestCase):
         count=b.add_tv_land_choices(rows,cat,src,names)
         self.assertEqual(count,2)
         self.assertEqual(src['US2']['TV.Land.HD.us2'],{'TV.Land.HD.us2'})
-        self.assertEqual(src['US1']['TV.Land.-.Eastern.us'],{'TV.Land.-.Eastern.us'})
+        self.assertEqual(src['US2']['TV.Land.HD.(Pacific).us2'],{'TV.Land.HD.(Pacific).us2'})
         self.assertNotIn('USA: TV LAND HD',sum(names.values(),[]))
     def test_all_nfl_team_feeds_quarantined(self):
         for name in ['USA: NFL Teams: FOX Rams (KTXL) Sacramento CA','USA: NFL Teams: CBS Bears (WBBM) Chicago IL']:
