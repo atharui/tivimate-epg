@@ -341,7 +341,7 @@ def add_tv_land_pacific_option(rows, catalog, matched_sources, channel_names):
     """
     has_tv_land=any(
         row.get('Region')=='USA' and
-        re.search(r'\\bTV\\s+LAND\\b',row.get('ChannelName',''),flags=re.I)
+        re.search(r'\bTV\s+LAND\b',row.get('ChannelName',''),flags=re.I)
         for row in rows
     )
     if not has_tv_land:
