@@ -18,6 +18,8 @@ on:
       - 'test_nfl_fox_feeds.py'
       - 'epg_identity.py'
       - 'audit_tvland.py'
+      - 'test_comedycentral_feed.py'
+      - 'audit_comedycentral.py'
       - 'test_epg_identity.py'
       - 'test_build_audit_regions.py'
       - 'epg_quality.py'
@@ -52,13 +54,15 @@ jobs:
         run: python publish_guide.py --candidate generated/Quality_Checked_EPG.xml.gz --destination site
       - name: Audit exact published TV Land channel blocks and programmes
         run: python audit_tvland.py site/guide.xml.gz
+      - name: Audit UK vs US Comedy Central at observed time
+        run: python audit_comedycentral.py site/guide.xml.gz
       - name: Publish compressed EPG to stable Release URL
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp site/guide.xml.gz generated/guide.xml.gz
           if gh release view epg-current >/dev/null 2>&1; then
-            gh release upload epg-current generated/guide.xml.gz generated/EPG_Public_Review.csv generated/EPG_Source_Status.json generated/TVLAND_Actual_File_Audit.json --clobber
+            gh release upload epg-current generated/guide.xml.gz generated/EPG_Public_Review.csv generated/EPG_Source_Status.json generated/TVLAND_Actual_File_Audit.json generated/Comedy_Central_Audit.json --clobber
           else
-            gh release create epg-current generated/guide.xml.gz generated/EPG_Public_Review.csv generated/EPG_Source_Status.json generated/TVLAND_Actual_File_Audit.json --title "Live EPG XMLTV (auto-updated)" --notes "Generated XMLTV listings, refreshed automatically. No IPTV credentials."
+            gh release create epg-current generated/guide.xml.gz generated/EPG_Public_Review.csv generated/EPG_Source_Status.json generated/TVLAND_Actual_File_Audit.json generated/Comedy_Central_Audit.json --title "Live EPG XMLTV (auto-updated)" --notes "Generated XMLTV listings, refreshed automatically. No IPTV credentials."
           fi

@@ -370,7 +370,21 @@ def add_tv_land_choices(rows,catalog,matched_sources,channel_names):
 
 
 def safe_match(row, idx):
-    """Only auto-map a guide when source/feed identity can be justified."""
+    """Only auto-map a guide when source/feed identity can be justified.
+
+    The single provider-labelled USA Comedy Central stream was observed live
+    showing Friends on 2026-11-12 19:27 UTC. Official US Comedy Central was
+    showing Seinfeld while UK Comedy Central showed Friends at that instant.
+    Reconcile this ONE stream with the UK source, never the entire region.
+    """
+    if (row.get('Region')=='USA' and
+        row.get('EPGChannelID','').strip().lower()=='comedycentral.us' and
+        normalize(row.get('ChannelName',''))=='comedy central'):
+        uk_ids=[(source,source_id) for source,source_id in idx[0].get('comedycentral.uk',[])
+                if source=='UK1' and source_id.lower()=='comedycentral.uk']
+        if uk_ids:
+            return uk_ids[0],'OBSERVED_UK_COMEDY_CENTRAL_FEED'
+        return None,'UK_COMEDY_CENTRAL_SOURCE_UNAVAILABLE'
     risk=feed_variant_risk(row)
     if risk:return None,risk
     if id_label_mismatch(row) or provider_id_mismatch(row):
@@ -472,7 +486,11 @@ def main():
         new['SourceGuideID']=matched[1] if matched else ''
         new['FinalEPGID']=output_id(row,matched) if matched else ''
         new['TiviMateAction']=('Automatic ID match is possible' if row['EPGChannelID'] else 'May require Assign EPG in TiviMate') if matched else 'No verified schedule; manual review needed'
-        if reason=='PROVIDER_ID_WRONG_STATION':
+        if reason=='OBSERVED_UK_COMEDY_CENTRAL_FEED':
+            new['TiviMateAction']='Provider labelled this stream USA but it matched UK Comedy Central broadcast (Friends vs US Seinfeld) on 2026-11-12; UK1 guide assigned under existing comedycentral.us ID. Review if provider changes feed.'
+        elif reason=='UK_COMEDY_CENTRAL_SOURCE_UNAVAILABLE':
+            new['TiviMateAction']='UK guide not available; do not substitute known-mismatched US guide; review manually'
+        elif reason=='PROVIDER_ID_WRONG_STATION':
             new['TiviMateAction']='Provider EPG ID contradicts channel identity; ask provider to correct tvg-id or manually Assign EPG'
         elif reason in ('NFL_TEAM_EVENT_FEED','EVENT_SCHEDULE_UNVERIFIED'):
             new['TiviMateAction']='Team/event labelled stream: schedule cannot be inferred from a broadcaster station; verify live event feed'
