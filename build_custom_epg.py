@@ -332,6 +332,33 @@ def quarantine_ambiguous_ids(matched_sources,report):
     return conflicted
 
 
+def add_tv_land_pacific_option(rows, catalog, matched_sources, channel_names):
+    """Expose an explicit Pacific choice without guessing the subscriber's coast.
+
+    The default TV Land East schedule remains unchanged. This adds a *separate*
+    XMLTV ID users can choose via TiviMate's Assign EPG when their live TV feed
+    is the Pacific version. The West ID must actually exist in the US2 index.
+    """
+    has_tv_land=any(
+        row.get('Region')=='USA' and
+        re.search(r'\\bTV\\s+LAND\\b',row.get('ChannelName',''),flags=re.I)
+        for row in rows
+    )
+    if not has_tv_land:
+        return False
+    pacific_id='TV.Land.HD.(Pacific).us2'
+    if not any(entry_id==pacific_id for entry_id,_ in catalog.get('US2',[])):
+        return False
+    # The Pacific listing has its own distinct EPG channel ID.
+    matched_sources['US2'][pacific_id].add(pacific_id)
+    channel_names[pacific_id]=[
+        'TV Land HD (Pacific)',
+        'TV LAND WEST',
+        'TV Land — Pacific feed'
+    ]
+    return True
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--input',default='Channels_US_Europe_Arabic.csv')
@@ -397,6 +424,8 @@ def main():
             for alias in aliases:
                 if alias and alias not in channel_names[key] and len(channel_names[key])<48:
                     channel_names[key].append(alias)
+        if add_tv_land_pacific_option(rows,cat,matched_sources,channel_names):
+            print('  TV LAND: kept Eastern default; added distinct Pacific guide for manual Assign EPG')
         for id_,names in channel_names.items():
             elem=ET.Element('channel',id=id_)
             for name in names:ET.SubElement(elem,'display-name').text=name
