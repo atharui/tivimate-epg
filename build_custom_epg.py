@@ -359,6 +359,42 @@ def add_tv_land_pacific_option(rows, catalog, matched_sources, channel_names):
     return True
 
 
+def is_unverified_nfl_fox_feed(row):
+    """An NFL-team-labelled stream is NOT proven to be the affiliate's 24/7 feed.
+
+    Previously KTXL/WBFF/WTTG local schedules were automatically assigned to
+    the Rams/Redskins team-labelled streams, producing unrelated programmes.
+    Preserve separate station guides for manual use only after live verification.
+    """
+    if row.get('Region')!='USA':
+        return False
+    name=row.get('ChannelName','')
+    if not re.search(r'NFL\s+TEAMS?\s*:',name,re.I):
+        return False
+    return bool(re.search(
+        r'FOX\s+(?:RAMS\s*\(KTXL\)|REDSKINS\s*\((?:WBFF|WTTG)\))',
+        name,re.I))
+
+
+def add_nfl_fox_local_station_options(catalog, matched_sources, channel_names):
+    """Make full local affiliate guides selectable, never auto-map NFL team feeds."""
+    choices={
+        'KTXL-DT.us_locals1':'FOX 40 KTXL Sacramento — complete local station',
+        'WBFF-DT.us_locals1':'FOX 45 WBFF Baltimore — complete local station',
+        'WTTG-DT.us_locals1':'FOX 5 WTTG Washington — complete local station',
+    }
+    indexed={id_ for id_,_ in catalog.get('US_LOCALS1',[])}
+    added=0
+    for id_,label in choices.items():
+        if id_ not in indexed:
+            continue
+        matched_sources['US_LOCALS1'][id_].add(id_)
+        if label not in channel_names[id_]:
+            channel_names[id_].append(label)
+        added+=1
+    return added
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--input',default='Channels_US_Europe_Arabic.csv')
@@ -382,7 +418,9 @@ def main():
     idx=index_by_name(cat)
     report=[]; matched_sources=defaultdict(lambda:defaultdict(set)); counts=Counter(); conflicts=defaultdict(set)
     for row in rows:
-        if provider_id_mismatch(row):
+        if is_unverified_nfl_fox_feed(row):
+            matched,reason=None,'NFL_TEAM_FEED_NOT_VERIFIED'
+        elif provider_id_mismatch(row):
             matched,reason=None,'PROVIDER_ID_MISMATCH'
         else:
             matched,reason=pick_match(row,idx)
@@ -395,6 +433,8 @@ def main():
         new['TiviMateAction']=('Automatic ID match is possible' if row['EPGChannelID'] else 'May require Assign EPG in TiviMate') if matched else 'No verified schedule; manual review needed'
         if reason=='PROVIDER_ID_MISMATCH':
             new['TiviMateAction']='IPTV provider tvg-id belongs to a different station; fix playlist or Assign EPG manually'
+        elif reason=='NFL_TEAM_FEED_NOT_VERIFIED':
+            new['TiviMateAction']='Team-labelled NFL stream is not verified as a full-time FOX local affiliate; never auto-assign KTXL/WBFF/WTTG schedules. Verify live feed before manually selecting a local station EPG.'
         report.append(new);counts[(row['Region'],new['MatchStatus'])]+=1
         if matched:
             conflicts[new['FinalEPGID']].add((matched[0],matched[1]))
@@ -426,6 +466,8 @@ def main():
                     channel_names[key].append(alias)
         if add_tv_land_pacific_option(rows,cat,matched_sources,channel_names):
             print('  TV LAND: kept Eastern default; added distinct Pacific guide for manual Assign EPG')
+        nfl_options=add_nfl_fox_local_station_options(cat,matched_sources,channel_names)
+        print(f'  NFL FOX: quarantined unverified Rams/Redskins team stream EPG; {nfl_options} separate full-station guides offered for manual verification')
         for id_,names in channel_names.items():
             elem=ET.Element('channel',id=id_)
             for name in names:ET.SubElement(elem,'display-name').text=name

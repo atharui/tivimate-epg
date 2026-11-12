@@ -15,6 +15,7 @@ on:
       - 'test_build_custom_epg.py'
       - 'test_builder_safety.py'
       - 'test_tvland_feeds.py'
+      - 'test_nfl_fox_feeds.py'
       - 'epg_quality.py'
       - 'test_epg_quality.py'
       - 'test_publish_guide.py'
