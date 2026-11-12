@@ -114,10 +114,13 @@ def name_variants(s):
 def select_identical_station(row,candidates):
     """Resolve same-channel/HD aliases across providers without guessing US local affiliates."""
     candidates=list(dict.fromkeys(candidates))
+    name=row['ChannelName']
+    sigs=callsign(name) if row['Region']=='USA' else set()
+    # Even a single source candidate can be the wrong local affiliate.
+    if sigs:
+        candidates=[c for c in candidates if not callsign(c[1]) or callsign(c[1]) & sigs]
     if not candidates:return None
     if len(candidates)==1:return candidates[0]
-    name=row['ChannelName']
-    sigs=callsign(name)
     # Distinct US callsigns are different stations with different schedules.
     if row['Region']=='USA':
         if sigs:
@@ -221,6 +224,18 @@ def index_by_name(catalog):
                     if obj not in by_call[sig]:by_call[sig].append(obj)
     return by_exact,by_norm,by_first,by_call
 
+def provider_id_mismatch(row):
+    """Known unsafe provider mapping: different beIN station number/type in tvg-id."""
+    cid=(row.get('EPGChannelID') or '').strip().lower()
+    name=(row.get('ChannelName') or '').upper()
+    if not cid:return False
+    num=re.search(r'BEIN\s+SPORTS?\s+XTRA\s*(\d+)\b',name)
+    ref=re.search(r'beinsportsxtra(\d+)',cid)
+    if num and ref and num.group(1)!=ref.group(1):return True
+    if re.search(r'\bBEIN\s+SPORTS?\s+\d+\b',name) and 'beinseries' in cid:return True
+    return False
+
+
 def pick_match(row,idx):
     exact,by_norm,by_first,by_call=idx
     allowed=set(country_sources(row))
@@ -296,6 +311,27 @@ def merge_guide(srcfile,source_to_ids,out,programme_counts):
                 if root is not None:root.clear()
     return kept
 
+def quarantine_ambiguous_ids(matched_sources,report):
+    """Never choose one arbitrary source if a target ID points to different stations."""
+    usages=defaultdict(set)
+    for src,groups in matched_sources.items():
+        for source_id,ids in groups.items():
+            for final_id in ids:
+                usages[final_id].add((src,source_id))
+    conflicted={eid for eid,mappings in usages.items() if len(mappings)>1}
+    if conflicted:
+        for groups in matched_sources.values():
+            for ids in groups.values():
+                ids.difference_update(conflicted)
+        for row in report:
+            if row.get('FinalEPGID') in conflicted:
+                row['MatchStatus']='UNMATCHED'
+                row['MatchMethod']='CONFLICTING_SOURCE_ID'
+                row['TiviMateAction']='Multiple different source schedules reuse the same EPG ID; manual verification required'
+                row['FinalEPGID']=''
+    return conflicted
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--input',default='Channels_US_Europe_Arabic.csv')
@@ -319,7 +355,10 @@ def main():
     idx=index_by_name(cat)
     report=[]; matched_sources=defaultdict(lambda:defaultdict(set)); counts=Counter(); conflicts=defaultdict(set)
     for row in rows:
-        matched,reason=pick_match(row,idx)
+        if provider_id_mismatch(row):
+            matched,reason=None,'PROVIDER_ID_MISMATCH'
+        else:
+            matched,reason=pick_match(row,idx)
         new=dict(row)
         new['MatchStatus']='MATCHED' if matched else 'UNMATCHED'
         new['MatchMethod']=reason
@@ -327,26 +366,16 @@ def main():
         new['SourceGuideID']=matched[1] if matched else ''
         new['FinalEPGID']=output_id(row,matched) if matched else ''
         new['TiviMateAction']=('Automatic ID match is possible' if row['EPGChannelID'] else 'May require Assign EPG in TiviMate') if matched else 'No verified schedule; manual review needed'
+        if reason=='PROVIDER_ID_MISMATCH':
+            new['TiviMateAction']='IPTV provider tvg-id belongs to a different station; fix playlist or Assign EPG manually'
         report.append(new);counts[(row['Region'],new['MatchStatus'])]+=1
         if matched:
             conflicts[new['FinalEPGID']].add((matched[0],matched[1]))
             matched_sources[matched[0]][matched[1]].add(new['FinalEPGID'])
-    conflict_ids={k for k,v in conflicts.items() if len(v)>1}
-    first={}
+    conflict_ids=quarantine_ambiguous_ids(matched_sources,report)
     if conflict_ids:
-        print(f'WARNING: {len(conflict_ids)} target EPG IDs have conflicting source mappings; first source will be kept.')
-        for src,groups in list(matched_sources.items()):
-            for source_id,ids in list(groups.items()):
-                for eid in list(ids):
-                    if eid in first and first[eid]!=(src,source_id):ids.remove(eid)
-                    else:first[eid]=(src,source_id)
-        for row in report:
-            eid=row['FinalEPGID']
-            if eid in conflict_ids and first.get(eid)!=(row['GuideSource'],row['SourceGuideID']):
-                row['MatchStatus']='UNMATCHED'
-                row['MatchMethod']='CONFLICTING_PROVIDER_ID'
-                row['TiviMateAction']='Manual verification: playlist EPG ID reused for different channels'
-                row['FinalEPGID']=''
+        print(f'WARNING: {len(conflict_ids)} EPG IDs point to different sources; quarantined all conflicting mappings.')
+    counts=Counter((r['Region'],r['MatchStatus']) for r in report)
     fields=list(rows[0])+['MatchStatus','MatchMethod','GuideSource','SourceGuideID','FinalEPGID','TiviMateAction']
     write_csv(outdir/'EPG_Match_Report.csv',report,fields)
     print('Match status by region:')
