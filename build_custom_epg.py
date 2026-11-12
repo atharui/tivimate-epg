@@ -11,6 +11,7 @@ import concurrent.futures
 import csv
 import difflib
 import gzip
+import json
 import io
 import os
 from pathlib import Path
@@ -21,6 +22,8 @@ import sys
 import unicodedata
 import urllib.request
 import xml.etree.ElementTree as ET
+from epg_identity import (feed_variant_risk, id_label_mismatch,
+                          provider_id_collisions, reason_for_row)
 
 BASE='https://epgshare01.online/epgshare01/'
 EU_SOURCES={
@@ -332,31 +335,66 @@ def quarantine_ambiguous_ids(matched_sources,report):
     return conflicted
 
 
-def add_tv_land_pacific_option(rows, catalog, matched_sources, channel_names):
-    """Expose an explicit Pacific choice without guessing the subscriber's coast.
+def add_tv_land_choices(rows,catalog,matched_sources,channel_names):
+    """Do not guess east/west from a generic TV Land playlist name.
 
-    The default TV Land East schedule remains unchanged. This adds a *separate*
-    XMLTV ID users can choose via TiviMate's Assign EPG when their live TV feed
-    is the Pacific version. The West ID must actually exist in the US2 index.
+    Both variants are independent, explicitly named manual EPG choices. Extra
+    US_ORG guide options are included only when their IDs explicitly identify
+    an east/west TV Land feed and that source is available.
     """
-    has_tv_land=any(
-        row.get('Region')=='USA' and
-        re.search(r'\bTV\s+LAND\b',row.get('ChannelName',''),flags=re.I)
-        for row in rows
-    )
-    if not has_tv_land:
-        return False
-    pacific_id='TV.Land.HD.(Pacific).us2'
-    if not any(entry_id==pacific_id for entry_id,_ in catalog.get('US2',[])):
-        return False
-    # The Pacific listing has its own distinct EPG channel ID.
-    matched_sources['US2'][pacific_id].add(pacific_id)
-    channel_names[pacific_id]=[
-        'TV Land HD (Pacific)',
-        'TV LAND WEST',
-        'TV Land — Pacific feed'
+    if not any(r.get('Region')=='USA' and
+               re.search(r'\\bTV\\s+LAND\\b',r.get('ChannelName',''),re.I)
+               for r in rows):
+        return 0
+    choices=[
+        ('US2','TV.Land.HD.us2','TV Land — EASTERN (US2 source)'),
+        ('US2','TV.Land.HD.(Pacific).us2','TV Land — PACIFIC (US2 source)')
     ]
-    return True
+    for source in ('US_ORG',):
+        for entry_id,_ in catalog.get(source,[]):
+            if not re.search(r'tv[. _-]*land',entry_id,re.I):
+                continue
+            if re.search(r'east|eastern',entry_id,re.I):
+                choices.append((source,entry_id,'TV Land — EASTERN ('+source+' source)'))
+            elif re.search(r'west|pacific',entry_id,re.I):
+                choices.append((source,entry_id,'TV Land — PACIFIC ('+source+' source)'))
+    count=0
+    for source,entry_id,label in choices:
+        if not any(x==entry_id for x,_ in catalog.get(source,[])):
+            continue
+        matched_sources[source][entry_id].add(entry_id)
+        if label not in channel_names[entry_id]:
+            channel_names[entry_id].append(label)
+        count+=1
+    return count
+
+
+def safe_match(row, idx):
+    """Only auto-map a guide when source/feed identity can be justified."""
+    risk=feed_variant_risk(row)
+    if risk:return None,risk
+    if id_label_mismatch(row) or provider_id_mismatch(row):
+        return None,'PROVIDER_ID_WRONG_STATION'
+    return pick_match(row,idx)
+
+
+def available_guide_candidates(row,idx):
+    """Non-secret metadata audit across every configured guide index."""
+    by_id,by_norm,_,by_call=idx
+    allowed=set(country_sources(row))
+    hits=set()
+    eid=(row.get('EPGChannelID') or '').strip().lower()
+    for s,c in by_id.get(eid,[]):
+        if s in allowed:hits.add((s,c))
+    for name in name_variants(row.get('ChannelName','')):
+        for s,c in by_norm.get(name,[]):
+            if s in allowed:hits.add((s,c))
+    if row.get('Region')=='USA':
+        for sig in callsign(row.get('ChannelName','')):
+            for s,c in by_call.get(sig,[]):
+                if s in allowed:hits.add((s,c))
+    return sorted(hits)
+
 
 
 def is_unverified_nfl_fox_feed(row):
@@ -416,25 +454,36 @@ def main():
             cat[src]=ids;print('  INDEX',src,len(ids))
     if not cat:raise SystemExit('No public EPG indexes were available; nothing has been fabricated.')
     idx=index_by_name(cat)
+    provider_collisions=provider_id_collisions(rows)
+    print(f'Identity audit: {len(provider_collisions)} provider IDs shared by distinct labels (manual review required).')
     report=[]; matched_sources=defaultdict(lambda:defaultdict(set)); counts=Counter(); conflicts=defaultdict(set)
     for row in rows:
-        if is_unverified_nfl_fox_feed(row):
-            matched,reason=None,'NFL_TEAM_FEED_NOT_VERIFIED'
-        elif provider_id_mismatch(row):
-            matched,reason=None,'PROVIDER_ID_MISMATCH'
-        else:
-            matched,reason=pick_match(row,idx)
+        matched,reason=safe_match(row,idx)
         new=dict(row)
+        risk_flags=reason_for_row(row,provider_collisions)
+        new['RiskFlags']=';'.join(risk_flags)
+        candidates=available_guide_candidates(row,idx)
+        new['CandidateSourceCount']=str(len({s for s,_ in candidates}))
+        new['CandidateGuideCount']=str(len(candidates))
+        new['CandidateExamples']=' | '.join(f'{s}:{c}' for s,c in candidates[:8])
         new['MatchStatus']='MATCHED' if matched else 'UNMATCHED'
         new['MatchMethod']=reason
         new['GuideSource']=matched[0] if matched else ''
         new['SourceGuideID']=matched[1] if matched else ''
         new['FinalEPGID']=output_id(row,matched) if matched else ''
         new['TiviMateAction']=('Automatic ID match is possible' if row['EPGChannelID'] else 'May require Assign EPG in TiviMate') if matched else 'No verified schedule; manual review needed'
-        if reason=='PROVIDER_ID_MISMATCH':
-            new['TiviMateAction']='IPTV provider tvg-id belongs to a different station; fix playlist or Assign EPG manually'
-        elif reason=='NFL_TEAM_FEED_NOT_VERIFIED':
-            new['TiviMateAction']='Team-labelled NFL stream is not verified as a full-time FOX local affiliate; never auto-assign KTXL/WBFF/WTTG schedules. Verify live feed before manually selecting a local station EPG.'
+        if reason=='PROVIDER_ID_WRONG_STATION':
+            new['TiviMateAction']='Provider EPG ID contradicts channel identity; ask provider to correct tvg-id or manually Assign EPG'
+        elif reason in ('NFL_TEAM_EVENT_FEED','EVENT_SCHEDULE_UNVERIFIED'):
+            new['TiviMateAction']='Team/event labelled stream: schedule cannot be inferred from a broadcaster station; verify live event feed'
+        elif reason=='TVLAND_FEED_UNSPECIFIED':
+            new['TiviMateAction']='Generic TV Land has no east/west identity; manually select and verify an explicit Eastern or Pacific listing'
+        elif reason=='REGIONAL_PROGRAMME_VARIANT':
+            new['TiviMateAction']='Regional version needs a location-specific guide; generic national ID may be wrong'
+        elif reason=='TIMESHIFT_FEED_NEEDS_VERIFICATION':
+            new['TiviMateAction']='Time-shift variant requires a feed-specific guide; do not infer from generic name'
+        elif 'SHARED_ID_DISTINCT_CHANNELS' in risk_flags:
+            new['TiviMateAction']='Shared provider ID with different labels; manual broadcast verification recommended'
         report.append(new);counts[(row['Region'],new['MatchStatus'])]+=1
         if matched:
             conflicts[new['FinalEPGID']].add((matched[0],matched[1]))
@@ -443,7 +492,8 @@ def main():
     if conflict_ids:
         print(f'WARNING: {len(conflict_ids)} EPG IDs point to different sources; quarantined all conflicting mappings.')
     counts=Counter((r['Region'],r['MatchStatus']) for r in report)
-    fields=list(rows[0])+['MatchStatus','MatchMethod','GuideSource','SourceGuideID','FinalEPGID','TiviMateAction']
+    fields=list(rows[0])+['MatchStatus','MatchMethod','GuideSource','SourceGuideID','FinalEPGID','TiviMateAction',
+                          'RiskFlags','CandidateSourceCount','CandidateGuideCount','CandidateExamples']
     write_csv(outdir/'EPG_Match_Report.csv',report,fields)
     print('Match status by region:')
     for reg in ('USA','EUROPE','ARABIC'):
@@ -464,8 +514,8 @@ def main():
             for alias in aliases:
                 if alias and alias not in channel_names[key] and len(channel_names[key])<48:
                     channel_names[key].append(alias)
-        if add_tv_land_pacific_option(rows,cat,matched_sources,channel_names):
-            print('  TV LAND: kept Eastern default; added distinct Pacific guide for manual Assign EPG')
+        tv_land_choices=add_tv_land_choices(rows,cat,matched_sources,channel_names)
+        print(f'  TV LAND: generic auto-match disabled, {tv_land_choices} explicitly named verified-source choices for manual comparison')
         nfl_options=add_nfl_fox_local_station_options(cat,matched_sources,channel_names)
         print(f'  NFL FOX: quarantined unverified Rams/Redskins team stream EPG; {nfl_options} separate full-station guides offered for manual verification')
         for id_,names in channel_names.items():
@@ -486,6 +536,20 @@ def main():
         row['AvailableProgrammes']=str(programme_counts[row['FinalEPGID']]) if row['FinalEPGID'] else '0'
         if row['FinalEPGID'] and not programme_counts[row['FinalEPGID']]:row['MatchStatus']='NO_CURRENT_PROGRAMMES'
     write_csv(outdir/'EPG_Match_Report.csv',report,fields+['AvailableProgrammes'])
+    # Public report contains guide metadata only, never IPTV provider stream IDs.
+    public_fields=['ChannelName','Region','CountryCode','EPGChannelID','MatchStatus','MatchMethod',
+                   'GuideSource','SourceGuideID','FinalEPGID','AvailableProgrammes',
+                   'RiskFlags','CandidateSourceCount','CandidateGuideCount','CandidateExamples','TiviMateAction']
+    write_csv(outdir/'EPG_Public_Review.csv',report,public_fields)
+    status={'configured_sources':len(sources),'downloaded_indexes':len(cat),
+            'source_index_sizes':{k:len(v) for k,v in sorted(cat.items())},
+            'failed_index_sources':[s for s,_ in errors],
+            'failed_programme_sources':[s for s,_ in failed_sources],
+            'provider_id_collision_groups':len(provider_collisions),
+            'risk_flags':dict(Counter(flag for r in report for flag in r.get('RiskFlags','').split(';') if flag)),
+            'manual_tv_land_variants':tv_land_choices,
+            'note':'Source availability and metadata consistency are NOT independent verification of live-stream programmes.'}
+    (outdir/'EPG_Source_Status.json').write_text(json.dumps(status,ensure_ascii=False,indent=2),encoding='utf-8')
     with open(outdir/'EPG_Summary.txt','w',encoding='utf-8') as f:
         f.write('EPG build — verified public source data only\n')
         f.write(f'Input channels: {len(rows)}\n')
